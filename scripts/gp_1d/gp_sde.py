@@ -24,7 +24,6 @@ from collections import namedtuple
 from typing import Optional, Union
 import gpytorch
 from gpytorch.kernels import RBFKernel, MaternKernel
-from multiscale_sde.sde import GPSDE
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -195,11 +194,11 @@ class LatentSDE(torchsde.SDEIto):
                 sde=self,
                 y0=aug_y0,
                 ts=ts_segment,
-                method=self.method,
-                dt=self.dt,
-                adaptive=self.adaptive,
-                rtol=self.rtol,
-                atol=self.atol,
+                method=args.method,
+                dt=args.dt,
+                adaptive=args.adaptive,
+                rtol=args.rtol,
+                atol=args.atol,
                 names={'drift': 'f_aug', 'diffusion': 'g_aug'}
             )
             ys_segment, logqp_path = aug_ys[:, :, 0:1], aug_ys[-1, :, :1]
@@ -210,7 +209,7 @@ class LatentSDE(torchsde.SDEIto):
             eps = torch.randn(batch_size, 1).to(self.qy0_std)
             y0 = self.qy0_mean + eps * self.qy0_std
             aug_y0 = torch.cat([y0, logqp_path], dim=1)
-
+        logqp_path = aug_ys[-1, :, 1]
         logqp = (logqp0 + logqp_path).mean(dim=0)  # KL(t=0) + KL(path).
         return ys, logqp
 
@@ -395,9 +394,9 @@ def main():
     # mixing time
     mixing_time = 0.3
     # when to begin solving
-    t_starts = torch.Tensor([0.0000, 0.4661])
+    t_starts = torch.Tensor([0, 1.65337661])
     # when to stop solving
-    t_ends = torch.Tensor([1.5302, 2])
+    t_ends = torch.Tensor([0.38607575, 1.8854651])
     ## suppose we start from y0 (data driven)
     ts_segments = []
     for i in range(t_starts.size()[0]):
@@ -516,14 +515,14 @@ def main():
             # # when to stop solving
             # t_ends = torch.Tensor([1.5302, 2])
             zs, kl = model.forward_skip(batch_size=args.batch_size, ts_segments=ts_segments)
+            zs = zs.squeeze()
         else:
             zs, kl = model(ts=ts_ext, batch_size=args.batch_size)
-        zs = zs.squeeze()
-        zs = zs[1:-1]  # Drop first and last which are only used to penalize out-of-data region and spread uncertainty.
+            zs = zs.squeeze()
+            zs = zs[1:-1]  # Drop first and last which are only used to penalize out-of-data region and spread uncertainty.
         likelihood_constructor = {"laplace": distributions.Laplace, "normal": distributions.Normal}[args.likelihood]
         likelihood = likelihood_constructor(loc=zs, scale=args.scale)
         logpy = likelihood.log_prob(ys).sum(dim=0).mean(dim=0)
-
         loss = -logpy + kl * kl_scheduler.val
         loss.backward()
 
@@ -534,7 +533,7 @@ def main():
         logpy_metric.step(logpy)
         kl_metric.step(kl)
         loss_metric.step(loss)
-
+        
         logging.info(
             f'global_step: {global_step}, '
             f'logpy: {logpy_metric.val:.3f}, '
