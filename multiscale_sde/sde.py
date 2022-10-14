@@ -97,7 +97,18 @@ class GPSDE(torchsde.SDEIto):
         logqp = (logqp0 + logqp_path).mean(dim=0)  # KL(t=0) + KL(path).
         return ys, logqp
 
-    def forward_skip(self, ts, batch_size, t_starts, t_ends, mixing_time, eps=None):
+    def sample_p(self, ts, batch_size, eps=None, bm=None):
+        eps = torch.randn(batch_size, 1).to(self.py0_mean) if eps is None else eps
+        y0 = self.py0_mean + eps * self.py0_std
+        return self.sdeint_fn(self, y0, ts, bm=bm, method='srk', dt=self.dt, names={'drift': 'h'})
+
+    def sample_q(self, ts, batch_size, eps=None, bm=None):
+        eps = torch.randn(batch_size, 1).to(self.qy0_mean) if eps is None else eps
+        y0 = self.qy0_mean + eps * self.qy0_std
+        return self.sdeint_fn(self, y0, ts, bm=bm, method='srk', dt=self.dt)
+
+    ### skipping operations
+    def forward_skip(self, batch_size, ts_segments, eps=None):
 
         # suppose we learn the stationary distribution
         eps = torch.randn(batch_size, 1).to(self.qy0_std) if eps is None else eps
@@ -107,10 +118,11 @@ class GPSDE(torchsde.SDEIto):
         logqp0 = distributions.kl_divergence(qy0, py0).sum(dim=1)  # KL(t=0).
         aug_y0 = torch.cat([y0, torch.zeros(batch_size, 1).to(y0)], dim=1)
         
-        for i in range(t_starts.size()[0]):
-            ts_segment = ts[(ts >= t_starts[i]) & (ts <= t_ends[i])]     
-            ts_segment[0] -= mixing_time
-            ts_segment[-1] += mixing_time
+        for i, ts_segment in enumerate(ts_segments):
+            # ts_segment = ts[(ts >= t_starts[i]) & (ts <= t_ends[i])]     
+            # ts_segment[0] -= mixing_time
+            # ts_segment[-1] += mixing_time
+            # ts_segment = ts_segments[i]
             aug_ys = self.sdeint_fn(
                 sde=self,
                 y0=aug_y0,
@@ -124,25 +136,15 @@ class GPSDE(torchsde.SDEIto):
             )
             ys_segment, logqp_path = aug_ys[:, :, 0:1], aug_ys[-1, :, :1]
             if i == 0:
-                ys = ys_segment
+                ys = ys_segment[1:-1]
             else:
-                ys = torch.concat([ys, ys_segment], axis=0)
-            eps = torch.randn(batch_size, 1).to(self.qy0_std) if eps is None else eps
+                ys = torch.concat([ys, ys_segment[1:-1]], axis=0)
+            eps = torch.randn(batch_size, 1).to(self.qy0_std)
             y0 = self.qy0_mean + eps * self.qy0_std
             aug_y0 = torch.cat([y0, logqp_path], dim=1)
 
         logqp = (logqp0 + logqp_path).mean(dim=0)  # KL(t=0) + KL(path).
         return ys, logqp
-
-    def sample_p(self, ts, batch_size, eps=None, bm=None):
-        eps = torch.randn(batch_size, 1).to(self.py0_mean) if eps is None else eps
-        y0 = self.py0_mean + eps * self.py0_std
-        return self.sdeint_fn(self, y0, ts, bm=bm, method='srk', dt=self.dt, names={'drift': 'h'})
-
-    def sample_q(self, ts, batch_size, eps=None, bm=None):
-        eps = torch.randn(batch_size, 1).to(self.qy0_mean) if eps is None else eps
-        y0 = self.qy0_mean + eps * self.qy0_std
-        return self.sdeint_fn(self, y0, ts, bm=bm, method='srk', dt=self.dt)
 
     # @property
     # def py0_std(self):

@@ -25,7 +25,7 @@ from typing import Optional, Union
 import gpytorch
 from gpytorch.kernels import RBFKernel, MaternKernel
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -33,6 +33,7 @@ import torch
 import tqdm
 from torch import distributions, nn, optim
 import torchsde
+from multiscale_sde.gp import MaternSDEKernel
 
 # w/ underscore -> numpy; w/o underscore -> torch.
 Data = namedtuple('Data', ['ts_', 'ts_ext_', 'ts_vis_', 'ts', 'ts_ext', 'ts_vis', 'ys', 'ys_'])
@@ -86,25 +87,13 @@ def _stable_division(a, b, epsilon=1e-7):
     b = torch.where(b.abs().detach() > epsilon, b, torch.full_like(b, fill_value=epsilon) * b.sign())
     return a / b
 
-
-lengthscale = 1 
 class LatentSDE(torchsde.SDEIto):
 
-    def __init__(self, theta=1.0, mu=0.0, sigma=1, lengthscale=0.5, device="cpu"):
+    def __init__(self, smoothness=0.5, variance=1, lengthscale=1, fix_variance=True, fix_lengthscale=True, device="cpu"):
         super(LatentSDE, self).__init__(noise_type="diagonal")
-        logvar = math.log(sigma ** 2 / (2. * theta))
-        # logvar = 1
-        std = 1
 
-        # Prior drift.
-        self.register_buffer("theta", torch.tensor([[theta]]))
-        self.register_buffer("mu", torch.tensor([[mu]]))
-        self.register_buffer("sigma", torch.tensor([[sigma]]))
-
-        # p(y0).
-        self.register_buffer("py0_mean", torch.tensor([[mu]]))
-        # self.register_buffer("py0_logvar", torch.tensor([[logvar]]))
-        self.register_buffer("py0_std", torch.tensor([[std]]))
+        # initial distribution p(y0).
+        self.register_buffer("py0_mean", torch.tensor([[0.0]]))
 
         # Approximate posterior drift: Takes in 2 positional encodings and the state.
         self.net = nn.Sequential(
@@ -119,10 +108,17 @@ class LatentSDE(torchsde.SDEIto):
         self.net[-1].bias.data.fill_(0.)
 
         # q(y0).
-        self.qy0_mean = nn.Parameter(torch.tensor([[mu]]), requires_grad=True)
+        logvar = math.log(1/ 2)
+        self.qy0_mean = nn.Parameter(torch.tensor([[0.0]]), requires_grad=True)
         self.qy0_logvar = nn.Parameter(torch.tensor([[logvar]]), requires_grad=True)
-        self.lengthscale = lengthscale
+
+        # define kernel function
+        self.kernel = MaternSDEKernel(smoothness=smoothness, variance=variance, lengthscale=lengthscale, fix_variance=fix_variance, fix_lengthscale=fix_lengthscale, device=device)
         self.device = device
+
+    @property
+    def qy0_std(self):
+        return torch.exp(.5 * self.qy0_logvar)
 
     def f(self, t, y):  # Approximate posterior drift.
         if t.dim() == 0:
@@ -131,12 +127,18 @@ class LatentSDE(torchsde.SDEIto):
         return self.net(torch.cat((torch.sin(t), torch.cos(t), y), dim=-1))
 
     def g(self, t, y):  # Shared diffusion.
+        """Define this using GP Kernel methods
+        """
         # return self.sigma.repeat(y.size(0), 1)
         # drift matrix = sigma^2 * sqrt(2 / l) for Matern12 kernel (diffusion of BM is 2/l)
-        return torch.ones(y.size(0), 1, device=self.device) * math.sqrt(2 / self.lengthscale)
+        return self.kernel.g(t, y)
+        # return torch.ones(y.size(0), 1, device=self.device) * math.sqrt(2 / (self.lengthscale))
 
     def h(self, t, y):  # Prior drift.
-        return -1/self.lengthscale * y
+        """Define this using GP Kernel methods
+        """
+        return self.kernel.f(t, y)
+        # return -1/self.lengthscale * y
 
     def f_aug(self, t, y):  # Drift for augmented dynamics with logqp term.
         y = y[:, 0:1]
@@ -155,7 +157,7 @@ class LatentSDE(torchsde.SDEIto):
         eps = torch.randn(batch_size, 1).to(self.qy0_std) if eps is None else eps
         y0 = self.qy0_mean + eps * self.qy0_std
         qy0 = distributions.Normal(loc=self.qy0_mean, scale=self.qy0_std)
-        py0 = distributions.Normal(loc=self.py0_mean, scale=self.py0_std)
+        py0 = distributions.Normal(loc=self.py0_mean, scale=self.kernel.stationary_covariance().sqrt())
         logqp0 = distributions.kl_divergence(qy0, py0).sum(dim=1)  # KL(t=0).
 
         aug_y0 = torch.cat([y0, torch.zeros(batch_size, 1).to(y0)], dim=1)
@@ -181,7 +183,7 @@ class LatentSDE(torchsde.SDEIto):
         eps = torch.randn(batch_size, 1).to(self.qy0_std) if eps is None else eps
         y0 = self.qy0_mean + eps * self.qy0_std
         qy0 = distributions.Normal(loc=self.qy0_mean, scale=self.qy0_std)
-        py0 = distributions.Normal(loc=self.py0_mean, scale=self.py0_std)
+        py0 = distributions.Normal(loc=self.py0_mean, scale=self.kernel.variance.sqrt())
         logqp0 = distributions.kl_divergence(qy0, py0).sum(dim=1)  # KL(t=0).
         aug_y0 = torch.cat([y0, torch.zeros(batch_size, 1).to(y0)], dim=1)
         
@@ -215,7 +217,7 @@ class LatentSDE(torchsde.SDEIto):
 
     def sample_p(self, ts, batch_size, eps=None, bm=None):
         eps = torch.randn(batch_size, 1).to(self.py0_mean) if eps is None else eps
-        y0 = self.py0_mean + eps * self.py0_std
+        y0 = self.py0_mean + eps * self.kernel.stationary_covariance().sqrt()
         return sdeint_fn(self, y0, ts, bm=bm, method='srk', dt=args.dt, names={'drift': 'h'})
 
     def sample_q(self, ts, batch_size, eps=None, bm=None):
@@ -223,43 +225,11 @@ class LatentSDE(torchsde.SDEIto):
         y0 = self.qy0_mean + eps * self.qy0_std
         return sdeint_fn(self, y0, ts, bm=bm, method='srk', dt=args.dt)
 
-    # @property
-    # def py0_std(self):
-    #     return torch.exp(.5 * self.py0_logvar)
 
-    @property
-    def qy0_std(self):
-        return torch.exp(.5 * self.qy0_logvar)
-
-
-def make_segmented_cosine_data():
-    ts_ = np.concatenate((np.linspace(0.3, 0.8, 10), np.linspace(1.2, 1.5, 10)), axis=0)
-    ts_ext_ = np.array([0.] + list(ts_) + [2.0])
-    ts_vis_ = np.linspace(0., 2.0, 300)
-    ys_ = np.cos(ts_ * (2. * math.pi))[:, None]
-
-    ts = torch.tensor(ts_).float()
-    ts_ext = torch.tensor(ts_ext_).float()
-    ts_vis = torch.tensor(ts_vis_).float()
-    ys = torch.tensor(ys_).float().to(device)
-    return Data(ts_, ts_ext_, ts_vis_, ts, ts_ext, ts_vis, ys, ys_)
-
-
-def make_irregular_sine_data():
-    ts_ = np.sort(np.random.uniform(low=0.4, high=1.6, size=16))
-    ts_ext_ = np.array([0.] + list(ts_) + [2.0])
-    ts_vis_ = np.linspace(0., 2.0, 300)
-    ys_ = np.sin(ts_ * (2. * math.pi))[:, None] * 0.8
-
-    ts = torch.tensor(ts_).float()
-    ts_ext = torch.tensor(ts_ext_).float()
-    ts_vis = torch.tensor(ts_vis_).float()
-    ys = torch.tensor(ys_).float().to(device)
-    return Data(ts_, ts_ext_, ts_vis_, ts, ts_ext, ts_vis, ys, ys_)
 
 def make_irregular_gp_data():
     k = MaternKernel(nu=0.5)
-    k.lengthscale = lengthscale
+    k.lengthscale = args.lengthscale
     ts = np.concatenate(
         [
             np.random.uniform(low=0.1, high=0.5, size=5),
@@ -282,8 +252,6 @@ def make_irregular_gp_data():
 
 def make_data():
     data_constructor = {
-        'segmented_cosine': make_segmented_cosine_data,
-        'irregular_sine': make_irregular_sine_data,
         'irregular_gp': make_irregular_gp_data
     }[args.data]
     return data_constructor()
@@ -300,9 +268,6 @@ class ExactGPModel(gpytorch.models.ExactGP):
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
-
-
-
 def main():
     # Dataset.
     ts_, ts_ext_, ts_vis_, ts, ts_ext, ts_vis, ys, ys_ = make_data()
@@ -314,7 +279,7 @@ def main():
     # get exact GP posterior
     model = ExactGPModel(torch.Tensor(ts_), torch.Tensor(ys_)[:,0], likelihood)
     model.likelihood.noise = args.scale**2
-    model.covar_module.lengthscale = lengthscale
+    model.covar_module.lengthscale = args.lengthscale
     # Get into evaluation (predictive posterior) mode
     model.eval()
     likelihood.eval()
@@ -359,7 +324,7 @@ def main():
     )  # We need space-time Levy area to use the SRK solver
 
     # Model.
-    model = LatentSDE(device=device, lengthscale=lengthscale).to(device)
+    model = LatentSDE(device=device, lengthscale=args.lengthscale, smoothness=args.smoothness).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-2)
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=.999)
     kl_scheduler = LinearScheduler(iters=args.kl_anneal_iters)
@@ -446,26 +411,23 @@ def main():
                     ax1.xticks([], [])
                     ax1.yticks([], [])
 
-                # # plot the prior
-                # zs = model.sample_p(ts=ts_vis, batch_size=vis_batch_size, eps=eps, bm=bm).squeeze()
-                # ts_vis_, zs_ = ts_vis.cpu().numpy(), zs.cpu().numpy()
-                # zs_ = np.sort(zs_, axis=1)
+                # plot the prior
+                zs = model.sample_p(ts=ts_vis, batch_size=vis_batch_size, eps=eps, bm=bm).squeeze()
+                ts_vis_, zs_ = ts_vis.cpu().numpy(), zs.cpu().numpy()
+                zs_ = np.sort(zs_, axis=1)
                 
-                # for alpha, percentile in zip(alphas, percentiles):
-                #     idx = int((1 - percentile) / 2. * vis_batch_size)
-                #     zs_bot_ = zs_[:, idx]
-                #     zs_top_ = zs_[:, -idx]
-                #     ax1.fill_between(ts_vis_, zs_bot_, zs_top_, alpha=alpha, color="C1")
+                for alpha, percentile in zip(alphas, percentiles):
+                    idx = int((1 - percentile) / 2. * vis_batch_size)
+                    zs_bot_ = zs_[:, idx]
+                    zs_top_ = zs_[:, -idx]
+                    ax1.fill_between(ts_vis_, zs_bot_, zs_top_, alpha=alpha, color="C1")
 
                 # plot exact GP 95% posterior 
-                ax1.fill_between(ts_vis_, lower, upper, alpha=0.3, color="green")
+                # ax1.fill_between(ts_vis_, lower, upper, alpha=0.3, color="green")
 
                 # plot KL at each point
                 eps_normal = torch.randn(args.batch_size, 1).to(model.qy0_std)
                 y0 = model.qy0_mean + eps_normal * model.qy0_std
-                qy0 = distributions.Normal(loc=model.qy0_mean, scale=model.qy0_std)
-                py0 = distributions.Normal(loc=model.py0_mean, scale=model.py0_std)
-                logqp0 = distributions.kl_divergence(qy0, py0).sum(dim=1)  # KL(t=0).
                 aug_y0 = torch.cat([y0, torch.zeros(args.batch_size, 1).to(y0)], dim=1)
                 aug_ys = sdeint_fn(
                     sde=model,
@@ -547,6 +509,7 @@ if __name__ == '__main__':
     # Trick from https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse.
     parser = argparse.ArgumentParser()
     parser.add_argument('--no-gpu', type=str2bool, default=False, const=True, nargs="?")
+    parser.add_argument('--gpu', type=str, default="cpu")
     parser.add_argument('--debug', type=str2bool, default=False, const=True, nargs="?")
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--train-dir', type=str, required=True)
@@ -568,6 +531,7 @@ if __name__ == '__main__':
     parser.add_argument('--dt', type=float, default=1e-2)
     parser.add_argument('--rtol', type=float, default=1e-3)
     parser.add_argument('--atol', type=float, default=1e-3)
+    parser.add_argument('--smoothness', type=float, default=0.5)
     parser.add_argument('--lengthscale', type=float, default=1)
 
     parser.add_argument('--show-prior', type=str2bool, default=True, const=True, nargs="?")
@@ -580,6 +544,7 @@ if __name__ == '__main__':
     parser.add_argument('--color', type=str, default='blue', choices=('blue', 'red'))
     args = parser.parse_args()
 
+    os.environ["CUDA_VISIBLE_DEVICES"] = f"{args.gpu}"
     device = torch.device('cuda' if torch.cuda.is_available() and not args.no_gpu else 'cpu')
     manual_seed(args.seed)
 
