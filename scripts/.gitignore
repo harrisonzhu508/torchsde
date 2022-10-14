@@ -1,0 +1,7 @@
+## ignore PNGs and gifs 
+
+*.png
+*.gif
+
+## ignore checkpoints
+*.ckpt
