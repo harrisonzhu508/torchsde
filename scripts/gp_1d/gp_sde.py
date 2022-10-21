@@ -24,6 +24,7 @@ from collections import namedtuple
 from typing import Optional, Union
 import gpytorch
 from gpytorch.kernels import RBFKernel, MaternKernel
+from multiscale_sde.util import softplus_inverse
 
 
 
@@ -91,38 +92,44 @@ class LatentSDE(torchsde.SDEIto):
 
     def __init__(self, smoothness=0.5, variance=1, lengthscale=1, fix_variance=True, fix_lengthscale=True, device="cpu"):
         super(LatentSDE, self).__init__(noise_type="diagonal")
-
-        # initial distribution p(y0).
-        self.register_buffer("py0_mean", torch.tensor([[0.0]]))
-
-        # Approximate posterior drift: Takes in 2 positional encodings and the state.
-        self.net = nn.Sequential(
-            nn.Linear(3, 200),
-            nn.Tanh(),
-            nn.Linear(200, 200),
-            nn.Tanh(),
-            nn.Linear(200, 1)
-        )
-        # Initialization trick from Glow.
-        self.net[-1].weight.data.fill_(0.)
-        self.net[-1].bias.data.fill_(0.)
-
-        # q(y0).
-        logvar = math.log(1/ 2)
-        self.qy0_mean = nn.Parameter(torch.tensor([[0.0]]), requires_grad=True)
-        self.qy0_logvar = nn.Parameter(torch.tensor([[logvar]]), requires_grad=True)
-
         # define kernel function
         self.kernel = MaternSDEKernel(smoothness=smoothness, variance=variance, lengthscale=lengthscale, fix_variance=fix_variance, fix_lengthscale=fix_lengthscale, device=device)
         self.device = device
+        
+        # initial distribution p(y0).
+        # self.register_buffer("py0_mean", torch.tensor([[0.0]]))
+        self.register_buffer("py0_mean", torch.zeros((self.kernel.state_dim())))
+
+        # Approximate posterior drift: Takes in 2 positional encodings and the state.
+        self.net = nn.Sequential(
+            nn.Linear(2 + self.kernel.state_dim(), 200),
+            nn.ReLU(),
+            nn.Linear(200, 200),
+            nn.ReLU(),
+            nn.Linear(200, self.kernel.state_dim())
+        )
+        # Initialization trick from Glow.
+        # self.net[-1].weight.data.fill_(0.)
+        # self.net[-1].bias.data.fill_(0.)
+
+        # q(y0).
+        # logvar = math.log(1/ 2)
+        
+        # self.qy0_mean = nn.Parameter(torch.tensor([[0.0]]), requires_grad=True)
+        # self.qy0_logvar = nn.Parameter(torch.tensor([[logvar]]), requires_grad=True)
+
+        self.qy0_mean = nn.Parameter(torch.zeros((self.kernel.state_dim())), requires_grad=True)
+        std_init = torch.ones((self.kernel.state_dim()))
+        std_init = softplus_inverse(std_init)
+        self.qy0_std_unconstrained = nn.Parameter(std_init, requires_grad=True)
 
     @property
     def qy0_std(self):
-        return torch.exp(.5 * self.qy0_logvar)
+        return nn.functional.softplus(self.qy0_std_unconstrained)
 
     def f(self, t, y):  # Approximate posterior drift.
         if t.dim() == 0:
-            t = torch.full_like(y, fill_value=t)
+            t = torch.full_like(y[:,:1], fill_value=t)
         # Positional encoding in transformers for time-inhomogeneous posterior.
         return self.net(torch.cat((torch.sin(t), torch.cos(t), y), dim=-1))
 
@@ -141,16 +148,20 @@ class LatentSDE(torchsde.SDEIto):
         # return -1/self.lengthscale * y
 
     def f_aug(self, t, y):  # Drift for augmented dynamics with logqp term.
-        y = y[:, 0:1]
-        f, g, h = self.f(t, y), self.g(t, y), self.h(t, y)
-        u = _stable_division(f - h, g)
+        y = y[:, 0:self.kernel.state_dim()]
+        f, pseudo_inv, h = self.f(t, y), self.kernel.diffusion_pseudoinverse(y), self.h(t, y)
+        # u = _stable_division(f - h, g)
+
+        # pseudo_inv: batch x state_dim
+        # f,h: batch x state_dim
+        u = pseudo_inv * (f-h)
         f_logqp = .5 * (u ** 2).sum(dim=1, keepdim=True)
         return torch.cat([f, f_logqp], dim=1)
 
     def g_aug(self, t, y):  # Diffusion for augmented dynamics with logqp term.
-        y = y[:, 0:1]
+        y = y[:, 0:self.kernel.state_dim()]
         g = self.g(t, y)
-        g_logqp = torch.zeros_like(y)
+        g_logqp = torch.zeros_like(y[:,:1])
         return torch.cat([g, g_logqp], dim=1)
 
     def forward(self, ts, batch_size, eps=None):
@@ -172,9 +183,10 @@ class LatentSDE(torchsde.SDEIto):
             atol=args.atol,
             names={'drift': 'f_aug', 'diffusion': 'g_aug'}
         )
-        ys, logqp_path = aug_ys[:, :, 0:1], aug_ys[-1, :, 1]
+        ys, logqp_path = aug_ys[:, :, :self.kernel.state_dim()], aug_ys[-1, :, -1]
         logqp = (logqp0 + logqp_path).mean(dim=0)  # KL(t=0) + KL(path).
-        return ys, logqp
+        out = torch.einsum("ij, tbj -> tbi", self.kernel.measurement_model(), ys)
+        return out, logqp
 
     ### skipping operations
     def forward_skip(self, batch_size, ts_segments, eps=None):
@@ -183,7 +195,7 @@ class LatentSDE(torchsde.SDEIto):
         eps = torch.randn(batch_size, 1).to(self.qy0_std) if eps is None else eps
         y0 = self.qy0_mean + eps * self.qy0_std
         qy0 = distributions.Normal(loc=self.qy0_mean, scale=self.qy0_std)
-        py0 = distributions.Normal(loc=self.py0_mean, scale=self.kernel.variance.sqrt())
+        py0 = distributions.Normal(loc=self.py0_mean, scale=self.kernel.stationary_covariance().sqrt())
         logqp0 = distributions.kl_divergence(qy0, py0).sum(dim=1)  # KL(t=0).
         aug_y0 = torch.cat([y0, torch.zeros(batch_size, 1).to(y0)], dim=1)
         
@@ -203,7 +215,7 @@ class LatentSDE(torchsde.SDEIto):
                 atol=args.atol,
                 names={'drift': 'f_aug', 'diffusion': 'g_aug'}
             )
-            ys_segment, logqp_path = aug_ys[:, :, 0:1], aug_ys[-1, :, :1]
+            ys_segment, logqp_path = aug_ys[:, :, 0:self.kernel.state_dim()], aug_ys[-1, :, 1:]
             if i == 0:
                 ys = ys_segment[1:-1]
             else:
@@ -211,19 +223,25 @@ class LatentSDE(torchsde.SDEIto):
             eps = torch.randn(batch_size, 1).to(self.qy0_std)
             y0 = self.qy0_mean + eps * self.qy0_std
             aug_y0 = torch.cat([y0, logqp_path], dim=1)
-        logqp_path = aug_ys[-1, :, 1]
+        logqp_path = aug_ys[-1, :, -1]
         logqp = (logqp0 + logqp_path).mean(dim=0)  # KL(t=0) + KL(path).
-        return ys, logqp
+        out = torch.einsum("ij, tbj -> tbi", self.kernel.measurement_model(), ys)
+        return out, logqp
 
     def sample_p(self, ts, batch_size, eps=None, bm=None):
         eps = torch.randn(batch_size, 1).to(self.py0_mean) if eps is None else eps
-        y0 = self.py0_mean + eps * self.kernel.stationary_covariance().sqrt()
-        return sdeint_fn(self, y0, ts, bm=bm, method='srk', dt=args.dt, names={'drift': 'h'})
+        y0 = self.py0_mean + torch.einsum("ij, bj -> bi", self.kernel.stationary_covariance().sqrt(), eps)
+        
+        yt = sdeint_fn(self, y0, ts, bm=bm, method='srk', dt=args.dt, names={'drift': 'h'})
+        out = torch.einsum("ij, tbj -> tbi", self.kernel.measurement_model(), yt)
+        return out
 
     def sample_q(self, ts, batch_size, eps=None, bm=None):
         eps = torch.randn(batch_size, 1).to(self.qy0_mean) if eps is None else eps
         y0 = self.qy0_mean + eps * self.qy0_std
-        return sdeint_fn(self, y0, ts, bm=bm, method='srk', dt=args.dt)
+        yt = sdeint_fn(self, y0, ts, bm=bm, method='srk', dt=args.dt, names={"drift" : "f"})
+        out = torch.einsum("ij, tbj -> tbi", self.kernel.measurement_model(), yt)
+        return out
 
 
 
@@ -296,7 +314,7 @@ def main():
 
     # Plotting parameters.
     vis_batch_size = 1024
-    ylims = (-1.5, 2.5)
+    ylims = (-3.5, 3.5)
     # alphas = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55]
     # percentiles = [0.999, 0.99, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
     alphas = [0.55]
@@ -314,17 +332,17 @@ def main():
         mean_color = '#800026'
         num_samples = len(sample_colors)
 
-    eps = torch.randn(vis_batch_size, 1).to(device)  # Fix seed for the random draws used in the plots.
-    bm = torchsde.BrownianInterval(
-        t0=ts_vis[0],
-        t1=ts_vis[-1],
-        size=(vis_batch_size, 1),
-        device=device,
-        levy_area_approximation='space-time'
-    )  # We need space-time Levy area to use the SRK solver
 
     # Model.
     model = LatentSDE(device=device, lengthscale=args.lengthscale, smoothness=args.smoothness).to(device)
+    eps = torch.randn(size=(vis_batch_size, model.kernel.state_dim())).to(device)  # Fix seed for the random draws used in the plots.
+    bm = torchsde.BrownianInterval(
+        t0=ts_vis[0],
+        t1=ts_vis[-1],
+        size=(vis_batch_size, model.kernel.state_dim()),
+        device=device,
+        levy_area_approximation='space-time'
+    )  # We need space-time Levy area to use the SRK solver
     optimizer = optim.Adam(model.parameters(), lr=1e-2)
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=.999)
     kl_scheduler = LinearScheduler(iters=args.kl_anneal_iters)
@@ -395,17 +413,20 @@ def main():
                     for j in range(num_samples):
                         ax1.plot(ts_vis_, samples_[:, j], color=sample_colors[j], linewidth=1.0)
 
-                if args.show_arrows:
-                    num, dt = 10, 0.14
-                    t, y = torch.meshgrid(
-                        [torch.linspace(0.2, 1.8, num).to(device), torch.linspace(-1.5, 2.5, num).to(device)]
-                    )
-                    t, y = t.reshape(-1, 1), y.reshape(-1, 1)
-                    fty = model.f(t=t, y=y).reshape(num, num)
-                    dt = torch.zeros(num, num).fill_(dt).to(device)
-                    dy = fty * dt
-                    dt_, dy_, t_, y_ = dt.cpu().numpy(), dy.cpu().numpy(), t.cpu().numpy(), y.cpu().numpy()
-                    ax1.quiver(t_, y_, dt_, dy_, alpha=0.3, edgecolors='k', width=0.0015, scale=200)
+                # if args.show_arrows:
+                #     num, dt = 10, 0.14
+                #     t, y = torch.meshgrid(
+                #         [torch.linspace(0.2, 1.8, num).to(device), torch.linspace(-1.5, 2.5, num).to(device)]
+                #     )
+                #     t, y = t.reshape(-1, 1), y.reshape(-1, 1)
+                #     fty = model.f(t=t, y=y)
+                #     # only show the drift in the first dimension i.e. not the derivatives
+                #     fty = torch.einsum("ij, tbj -> tbi", model.kernel.measurement_model(), fty)
+                #     fty = fty.reshape(num, num)
+                #     dt = torch.zeros(num, num).fill_(dt).to(device)
+                #     dy = fty * dt
+                #     dt_, dy_, t_, y_ = dt.cpu().numpy(), dy.cpu().numpy(), t.cpu().numpy(), y.cpu().numpy()
+                #     ax1.quiver(t_, y_, dt_, dy_, alpha=0.3, edgecolors='k', width=0.0015, scale=200)
 
                 if args.hide_ticks:
                     ax1.xticks([], [])
@@ -479,6 +500,7 @@ def main():
             zs, kl = model.forward_skip(batch_size=args.batch_size, ts_segments=ts_segments)
             zs = zs.squeeze()
         else:
+            # print("\n\n", model.kernel.variance, model.qy0_std, model.qy0_mean)
             zs, kl = model(ts=ts_ext, batch_size=args.batch_size)
             zs = zs.squeeze()
             zs = zs[1:-1]  # Drop first and last which are only used to penalize out-of-data region and spread uncertainty.
