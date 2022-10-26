@@ -20,7 +20,6 @@ from torch import distributions, nn, optim
 import torchsde
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-os.makedirs("plots/", exist_ok=True)
 
 def manual_seed(seed: int):
     random.seed(seed)
@@ -32,7 +31,7 @@ plt.style.use('seaborn-poster')
 
 # SDE solver config
 method = "euler"
-dt = 1e-3
+dt = 1e-2
 adaptive = False
 rtol = 1e-3
 atol = 1e-3
@@ -43,7 +42,7 @@ batch_size=512
 sdeint_fn = torchsde.sdeint
 
 
-# generate data
+# generate data 
 ts = np.linspace(0., 2., 100)
 ts = np.sort(ts)
 ts = torch.Tensor(ts).to(device)
@@ -60,13 +59,14 @@ class AgeHeartSDE(torchsde.SDEIto):
 
     def f(self, t, y):  # drift
         y_1 = y[:,:1]
+        y_2 = y[:,1:]
         drift_1 = torch.ones(y_1.size(), device=self.device)
-        drift_2 = y_1*20*torch.cos(2*np.pi * t / self.period)
+        drift_2 = 20*y_1*torch.cos(2*np.pi * y_1 / self.period) + y_2
         drift = torch.cat([drift_1, drift_2], axis=1)
         return drift
     
     def g(self, t, y):  # Diffusion.
-        return torch.ones(y.size(), device=self.device)*math.sqrt(2)
+        return torch.ones(y.size(), device=self.device)*0.01
 
     def forward(self, ts, batch_size, eps=None):
         eps = torch.randn(batch_size, 1).to(self.y0_std) if eps is None else eps
@@ -92,9 +92,8 @@ ax1.plot(ts_plot, y_plot[:,:,0])
 ax2.plot(ts_plot, y_plot[:,:,1])
 plt.savefig("data.pdf")
 ## select training data
-ts_train = ts[:, None]
+ts_train = ts
 y_train = y[:,0,:]
-
 
 ##########################################
 ################SDE Model#################
@@ -108,6 +107,7 @@ dt = 1e-2
 adaptive = False 
 rtol = 1e-3
 atol = 1e-3
+os.makedirs(f"plots_dt{dt}/", exist_ok=True)
 
 class LinearScheduler(object):
     def __init__(self, iters, maxval=1.0):
@@ -135,42 +135,66 @@ class LatentSDE(torchsde.SDEIto):
 
         # Approximate posterior drifts
         self.net1 = nn.Sequential(
-            nn.Linear(1, 32),
+            nn.Linear(1, 128),
             nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
         )
         
         self.net2 = nn.Sequential(
-            nn.Linear(2, 32),
+            nn.Linear(2, 128),
             nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
         )
 
         # Prior drifts
         self.prior_net1 = nn.Sequential(
-            nn.Linear(1, 32),
+            nn.Linear(1, 128),
             nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
         )
         
         self.prior_net2 = nn.Sequential(
-            nn.Linear(2, 32),
+            nn.Linear(2, 128),
             nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
         )
 
         # set prior and posterior initial conditions
-        self.register_buffer("py0_mean", torch.zeros((2)))
-        self.register_buffer("py0_std", torch.ones((2)))
-        self.qy0_mean = nn.Parameter(torch.tensor([0., 0.]), requires_grad=True)
-        self.qy0_std_unconstrained = nn.Parameter(torch.tensor([1., 1.]), requires_grad=True)
+        # self.register_buffer("py0_mean", torch.zeros((2)))
+        # self.register_buffer("py0_std", torch.ones((2)))
+        self.py0_mean = nn.Parameter(torch.tensor([1.541, 1.541]), requires_grad=True)
+        self.py0_std_unconstrained = nn.Parameter(torch.tensor([0.01, 0.01]), requires_grad=True)
+        self.qy0_mean = nn.Parameter(torch.tensor([1.541, 1.541]), requires_grad=True)
+        self.qy0_std_unconstrained = nn.Parameter(torch.tensor([0.01, 0.01]), requires_grad=True)
     @property
     def qy0_std(self):
         return nn.functional.softplus(self.qy0_std_unconstrained)
+    @property
+    def py0_std(self):
+        return nn.functional.softplus(self.qy0_std_unconstrained)
 
     def f(self, t, y):  # Approximate posterior drift.
+
+        # neural networks with fourier time features
+        # t = torch.full_like(y[:,:1], fill_value=t.item())
+        # drift1 = self.net1(torch.cat((torch.sin(t), torch.cos(t), y[:, :1]), axis=1))
+        # drift2 = self.net2(torch.cat((torch.sin(t), torch.cos(t), y), axis=1))
+        
+        # neural network
         drift1 = self.net1(y[:,:1])
         drift2 = self.net2(y)
+
+        # ground truth
+        # drift1 = torch.ones(y[:,:1].size(), device=self.device)
+        # drift2 = 20*y[:,:1]*torch.cos(2*np.pi * y[:,:1] / 0.2) + y[:,1:2]
         drift = torch.cat([drift1, drift2], axis=1)
         return drift
 
@@ -185,7 +209,7 @@ class LatentSDE(torchsde.SDEIto):
         """
         # return self.sigma.repeat(y.size(0), 1)
         # drift matrix = sigma^2 * sqrt(2 / l) for Matern12 kernel (diffusion of BM is 2/l)
-        return torch.ones(y.size(), device=self.device) * math.sqrt(2)
+        return torch.ones(y.size(), device=self.device)*0.01
 
     def f_aug(self, t, y):  # Drift for augmented dynamics with logqp term.
         y = y[:,:-1]
@@ -243,14 +267,14 @@ model = LatentSDE(device=device).to(device)
 optimizer = optim.Adam(model.parameters(), lr=1e-2)
 scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=.999)
 kl_scheduler = LinearScheduler(iters=100)
-for global_step in tqdm.tqdm(range(300+1)):
+for global_step in tqdm.tqdm(range(1000 +1)):
     optimizer.zero_grad()
     zs, kl = model(ts=ts_train, batch_size=128)
     zs = zs.squeeze()
     # zs = zs[1:-1]  # Drop first and last which are only used to penalize out-of-data region and spread uncertainty.
     likelihood_constructor = distributions.Normal
-    likelihood = likelihood_constructor(loc=zs, scale=0.01)
-    logpy = likelihood.log_prob(y_train[:,None,:]).sum(dim=[0,-1]).mean(dim=0)
+    likelihood = likelihood_constructor(loc=zs, scale=1)
+    logpy = likelihood.log_prob(y_train[:,None,:]).mean(dim=1).sum()
     loss = -logpy + kl * kl_scheduler.val
     loss.backward()
 
@@ -258,8 +282,10 @@ for global_step in tqdm.tqdm(range(300+1)):
     scheduler.step()
     kl_scheduler.step()
     if global_step % 50 == 0:
-        y_pred_plot = zs.cpu().detach().numpy()
-        y_pred = zs.mean(1).cpu().detach().numpy()
+        print(model.qy0_mean.cpu().detach().numpy())
+        posterior_samples = model.sample_q(ts_train, batch_size=128)
+        y_pred_plot = posterior_samples.cpu().detach().numpy()
+        y_pred = posterior_samples.mean(1).cpu().detach().numpy()
         fig, (ax1, ax2) = plt.subplots(2, frameon=False, figsize=(20,10), sharex=True)
         ax1.plot(ts_plot, y_pred[:,0], color="C0")
         ax2.plot(ts_plot, y_pred[:,1], color="C0")
@@ -279,9 +305,9 @@ for global_step in tqdm.tqdm(range(300+1)):
         ax2.scatter(ts_plot, y_plot[:,0,1], color="black")
 
         ax1.set_ylabel("First Scale")
-        ax2.set_ylabel("First Scale")
+        ax2.set_ylabel("Second Scale")
         
         ax1.set_xlabel("Time $t$")
         ax2.set_xlabel("Time $t$")
-        plt.savefig(f"plots/{global_step}.pdf")
+        plt.savefig(f"plots_dt{dt}/{global_step}.pdf")
     
