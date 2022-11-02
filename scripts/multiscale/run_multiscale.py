@@ -103,7 +103,7 @@ sdeint_fn = torchsde.sdeint
 
 # pick model hyperparameters
 method = "euler"
-dt = 1e-2
+dt = 5e-3
 adaptive = False 
 rtol = 1e-3
 atol = 1e-3
@@ -135,51 +135,55 @@ class LatentSDE(torchsde.SDEIto):
 
         # Approximate posterior drifts
         self.net1 = nn.Sequential(
-            nn.Linear(1, 128),
+            nn.Linear(1, 32),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Linear(32, 1)
         )
         
         self.net2 = nn.Sequential(
-            nn.Linear(2, 128),
+            nn.Linear(2, 32),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Linear(32, 1)
         )
 
         # Prior drifts
         self.prior_net1 = nn.Sequential(
-            nn.Linear(1, 128),
+            nn.Linear(1, 32),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Linear(32, 1)
         )
         
         self.prior_net2 = nn.Sequential(
-            nn.Linear(2, 128),
+            nn.Linear(2, 32),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Linear(32, 1)
         )
 
         # set prior and posterior initial conditions
         # self.register_buffer("py0_mean", torch.zeros((2)))
         # self.register_buffer("py0_std", torch.ones((2)))
-        self.py0_mean = nn.Parameter(torch.tensor([1.541, 1.541]), requires_grad=True)
-        self.py0_std_unconstrained = nn.Parameter(torch.tensor([0.01, 0.01]), requires_grad=True)
+        self.py0_mean = nn.Parameter(torch.tensor([0., 0.]), requires_grad=True)
+        self.py0_std_unconstrained = nn.Parameter(torch.tensor([1., 1.]), requires_grad=True)
         self.qy0_mean = nn.Parameter(torch.tensor([1.541, 1.541]), requires_grad=True)
         self.qy0_std_unconstrained = nn.Parameter(torch.tensor([0.01, 0.01]), requires_grad=True)
+        self.diffusion_unconstrained = nn.Parameter(torch.tensor([math.sqrt(2)]), requires_grad=True)
     @property
     def qy0_std(self):
         return nn.functional.softplus(self.qy0_std_unconstrained)
     @property
     def py0_std(self):
-        return nn.functional.softplus(self.qy0_std_unconstrained)
+        return nn.functional.softplus(self.py0_std_unconstrained)
+    @property
+    def diffusion(self):
+        return nn.functional.softplus(self.diffusion_unconstrained)
 
     def f(self, t, y):  # Approximate posterior drift.
 
@@ -192,24 +196,37 @@ class LatentSDE(torchsde.SDEIto):
         drift1 = self.net1(y[:,:1])
         drift2 = self.net2(y)
 
-        # ground truth
-        # drift1 = torch.ones(y[:,:1].size(), device=self.device)
-        # drift2 = 20*y[:,:1]*torch.cos(2*np.pi * y[:,:1] / 0.2) + y[:,1:2]
+        # # ground truth
+        # # drift1 = torch.ones(y[:,:1].size(), device=self.device)
+        # # drift2 = 20*y[:,:1]*torch.cos(2*np.pi * y[:,:1] / 0.2) + y[:,1:2]
         drift = torch.cat([drift1, drift2], axis=1)
         return drift
+        # y_1 = y[:,:1]
+        # y_2 = y[:,1:]
+        # drift_1 = torch.ones(y_1.size(), device=self.device)
+        # drift_2 = 20*y_1*torch.cos(2*np.pi * y_1 / 0.2) + y_2
+        # drift = torch.cat([drift_1, drift_2], axis=1)
+        # return drift
 
     def f_prior(self, t, y):  # Prior drift.
         drift1 = self.prior_net1(y[:,:1])
         drift2 = self.prior_net2(y)
         drift = torch.cat([drift1, drift2], axis=1)
+        # return -y/2
+        # y_1 = y[:,:1]
+        # y_2 = y[:,1:]
+        # drift_1 = torch.ones(y_1.size(), device=self.device)
+        # drift_2 = 20*y_1*torch.cos(2*np.pi * y_1 / 0.2) + y_2
+        # drift = torch.cat([drift_1, drift_2], axis=1)
         return drift
-    
+
     def g(self, t, y):  # Shared diffusion.
         """
         """
         # return self.sigma.repeat(y.size(0), 1)
         # drift matrix = sigma^2 * sqrt(2 / l) for Matern12 kernel (diffusion of BM is 2/l)
-        return torch.ones(y.size(), device=self.device)*0.01
+        return torch.ones(y.size(), device=self.device)*self.diffusion
+        # return torch.ones(y.size(), device=self.device)*math.sqrt(2)
 
     def f_aug(self, t, y):  # Drift for augmented dynamics with logqp term.
         y = y[:,:-1]
@@ -273,41 +290,44 @@ for global_step in tqdm.tqdm(range(1000 +1)):
     zs = zs.squeeze()
     # zs = zs[1:-1]  # Drop first and last which are only used to penalize out-of-data region and spread uncertainty.
     likelihood_constructor = distributions.Normal
-    likelihood = likelihood_constructor(loc=zs, scale=1)
-    logpy = likelihood.log_prob(y_train[:,None,:]).mean(dim=1).sum()
+    likelihood = likelihood_constructor(loc=zs, scale=0.1)
+    logpy = likelihood.log_prob(y_train[:,None,:]).sum(0).mean(dim=1).mean()
     loss = -logpy + kl * kl_scheduler.val
     loss.backward()
 
     optimizer.step()
     scheduler.step()
     kl_scheduler.step()
-    if global_step % 50 == 0:
-        print(model.qy0_mean.cpu().detach().numpy())
-        posterior_samples = model.sample_q(ts_train, batch_size=128)
-        y_pred_plot = posterior_samples.cpu().detach().numpy()
-        y_pred = posterior_samples.mean(1).cpu().detach().numpy()
-        fig, (ax1, ax2) = plt.subplots(2, frameon=False, figsize=(20,10), sharex=True)
-        ax1.plot(ts_plot, y_pred[:,0], color="C0")
-        ax2.plot(ts_plot, y_pred[:,1], color="C0")
+    with torch.no_grad():
+        if global_step % 50 == 0:
+            print(model.qy0_mean.cpu().detach().numpy())
+            posterior_samples = model.sample_q(ts_train, batch_size=128)
+            y_pred_plot = posterior_samples.cpu().detach().numpy()
+            y_pred = posterior_samples.mean(1).cpu().detach().numpy()
+            fig, (ax1, ax2) = plt.subplots(2, frameon=False, figsize=(20,10), sharex=True)
+            ax1.plot(ts_plot, y_pred[:,0], color="C0")
+            ax2.plot(ts_plot, y_pred[:,1], color="C0")
 
-        # plot the credible interval
-        y_pred_plot[:,:,0] = np.sort(y_pred_plot[:,:,0], axis=1)
-        y_pred_plot[:,:,1] = np.sort(y_pred_plot[:,:,1], axis=1)
-        percentile = 0.95
-        idx = int((1 - percentile) / 2. * y_pred_plot.shape[1])
-        y_pred_plot_bottom, y_pred_plot_top = y_pred_plot[:, idx,0], y_pred_plot[:, -idx,0]
-        ax1.fill_between(ts_plot, y_pred_plot_bottom, y_pred_plot_top, alpha=0.3, color="C0")
+            # plot the credible interval
+            y_pred_plot[:,:,0] = np.sort(y_pred_plot[:,:,0], axis=1)
+            y_pred_plot[:,:,1] = np.sort(y_pred_plot[:,:,1], axis=1)
+            percentile = 0.95
+            idx = int((1 - percentile) / 2. * y_pred_plot.shape[1])
+            y_pred_plot_bottom, y_pred_plot_top = y_pred_plot[:, idx,0], y_pred_plot[:, -idx,0]
+            ax1.fill_between(ts_plot, y_pred_plot_bottom, y_pred_plot_top, alpha=0.3, color="C0")
 
-        y_pred_plot_bottom, y_pred_plot_top = y_pred_plot[:, idx,1], y_pred_plot[:, -idx,1]
-        ax2.fill_between(ts_plot, y_pred_plot_bottom, y_pred_plot_top, alpha=0.3, color="C0")
+            y_pred_plot_bottom, y_pred_plot_top = y_pred_plot[:, idx,1], y_pred_plot[:, -idx,1]
+            ax2.fill_between(ts_plot, y_pred_plot_bottom, y_pred_plot_top, alpha=0.3, color="C0")
 
-        ax1.scatter(ts_plot, y_plot[:,0,0], color="black")
-        ax2.scatter(ts_plot, y_plot[:,0,1], color="black")
+            ax1.scatter(ts_plot, y_plot[:,0,0], color="black")
+            ax2.scatter(ts_plot, y_plot[:,0,1], color="black")
+            for j in range(5):
+                ax2.plot(ts_plot, posterior_samples[:,j,1].cpu().detach().numpy(), color="red", linewidth=1.0, alpha=0.5)
 
-        ax1.set_ylabel("First Scale")
-        ax2.set_ylabel("Second Scale")
+            ax1.set_ylabel("First Scale")
+            ax2.set_ylabel("Second Scale")
+            
+            ax1.set_xlabel("Time $t$")
+            ax2.set_xlabel("Time $t$")
+            plt.savefig(f"plots_dt{dt}/{global_step}.pdf")
         
-        ax1.set_xlabel("Time $t$")
-        ax2.set_xlabel("Time $t$")
-        plt.savefig(f"plots_dt{dt}/{global_step}.pdf")
-    
