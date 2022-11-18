@@ -18,6 +18,7 @@ def str2bool(v):
 import argparse
 parser = argparse.ArgumentParser(description='Multiscale SDE Trainer')
 parser.add_argument('--skip', type=str2bool, default=False)
+parser.add_argument('--inductive_bias', type=str2bool, default=False)
 parser.add_argument('--epochs', type=int, default=1000)
 parser.add_argument('--num_latent', type=int, default=1)
 parser.add_argument('--gpu', type=int, default=0)
@@ -27,7 +28,7 @@ num_latent = args.num_latent
 print("Skip==",skip)
 epochs = args.epochs
 gpu = args.gpu
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+os.environ["CUDA_VISIBLE_DEVICES"] = f"{gpu}"
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -136,7 +137,7 @@ dt = 1e-2
 adaptive = False 
 rtol = 1e-3
 atol = 1e-3
-os.makedirs(f"plots_num_latent{num_latent}_dt{dt}_skip{skip}", exist_ok=True)
+os.makedirs(f"plots_num_latent{num_latent}_dt{dt}_skip{skip}_inductivebias{args.inductive_bias}", exist_ok=True)
 class LinearScheduler(object):
     def __init__(self, iters, maxval=1.0):
         self._iters = max(1, iters)
@@ -456,44 +457,44 @@ class LatentSDE(torchsde.SDEIto):
 
         # Approximate posterior drifts
         self.net1 = nn.Sequential(
-            nn.Linear(1, 200),
+            nn.Linear(1, 32),
             nn.ReLU(),
-            nn.Linear(200, 200),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(200, 1)
+            nn.Linear(32, 1)
         )
         
         self.net2 = nn.Sequential(
-            nn.Linear(1 + num_latent, 200),
+            nn.Linear(1 + num_latent, 32),
             nn.ReLU(),
-            nn.Linear(200, 200),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(200, num_latent)
+            nn.Linear(32, num_latent)
         )
 
         # # Prior drifts
         self.prior_net1 = nn.Sequential(
-            nn.Linear(1, 200),
+            nn.Linear(1, 32),
             nn.ReLU(),
-            nn.Linear(200, 200),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(200, 1)
+            nn.Linear(32, 1)
         )
         
         self.prior_net2 = nn.Sequential(
-            nn.Linear(1 + num_latent, 200),
+            nn.Linear(1 + num_latent, 32),
             nn.ReLU(),
-            nn.Linear(200, 200),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(200, num_latent)
+            nn.Linear(32, num_latent)
         )
 
         self.decoder = nn.Sequential(
-            nn.Linear(num_latent, 200),
+            nn.Linear(num_latent, 32),
             nn.ReLU(),
-            nn.Linear(200, 200),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(200, 1)
+            nn.Linear(32, 1)
         )
 
         # Initialization trick from Glow.
@@ -568,12 +569,17 @@ class LatentSDE(torchsde.SDEIto):
         # drift2 = self.f_2_prior(t, y)
         # drift = torch.cat([drift1, drift2], axis=1)
         # return drift
-        return -y/4
-        # y_1 = y[:,:1]
+        # return -y/4
+        y_1 = y[:,:1]
         # y_2 = y[:,1:]
-        # drift_1 = torch.ones(y_1.size(), device=self.device)
-        # drift_2 = 5*y_2*torch.cos(2*np.pi * y_1 / 0.3)
-        # drift = torch.cat([drift_1, drift_2], axis=1)
+        if args.inductive_bias:
+            drift1 = torch.ones(y_1.size(), device=self.device)
+        else:
+            drift1 = self.f_1_prior(t, y_1)
+        drift2 = self.f_2_prior(t, y)
+        # drift_2 = -y/2
+        drift = torch.cat([drift1, drift2], axis=1)
+        return drift
 
     def g(self, t, y):  # Shared diffusion.
         """
@@ -831,9 +837,9 @@ for global_step in tqdm.tqdm(range(epochs +1)):
             
             ax1.set_xlabel("Time $t$")
             ax2.set_xlabel("Time $t$")
-            plt.savefig(f"plots_num_latent{num_latent}_dt{dt}_skip{skip}/{global_step}.png")
+            plt.savefig(f"plots_num_latent{num_latent}_dt{dt}_skip{skip}_inductivebias{args.inductive_bias}/{global_step}.png")
             save_checkpoint({
                 'epoch': global_step,
                 'model': model.state_dict()
-            }, filename=f"plots_num_latent{num_latent}_dt{dt}_skip{skip}/model_epoch{global_step}")
+            }, filename=f"plots_num_latent{num_latent}_dt{dt}_skip{skip}_inductivebias{args.inductive_bias}/model_epoch{global_step}")
         
