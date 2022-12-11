@@ -13,3 +13,6 @@ CMakeLists.txt
 restats
 *-darwin.so
 **.pyc
+
+*.pdf
+*.png
