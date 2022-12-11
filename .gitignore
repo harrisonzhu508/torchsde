@@ -17,3 +17,4 @@ restats
 *.pdf
 *.png
 *.tar
+*.npz
